@@ -1,0 +1,897 @@
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import { Mic, MicOff, Settings, X, AlertTriangle, Eye, EyeOff } from "lucide-react";
+
+/**
+ * M.A.L.I. (Multi-Agent Lunar Intelligence)
+ * A single-file, voice-controlled, Jarvis-like AI assistant.
+ *
+ * Persona: "Mali" (มะลิ) — a polite, humble Thai female assistant who
+ * always addresses the user as "Khun Muk" (คุณมุก).
+ *
+ * On first load Mali greets Khun Muk, states the current date, time and
+ * (if location access is granted) province, then automatically opens the
+ * microphone — no button press required.
+ *
+ * Stack: React + Tailwind CSS + lucide-react + Web Speech API (STT/TTS)
+ * + Google Gemini API (gemini-1.5-flash, v1 stable endpoint).
+ *
+ * Drop this component anywhere in a Tailwind-enabled React app and
+ * render <MaliAssistant /> — everything (UI, logic, styling) lives here.
+ */
+
+const GEMINI_ENDPOINT =
+  "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent";
+
+const API_KEY_STORAGE_KEY = "mali_gemini_api_key";
+const VOICE_STORAGE_KEY = "mali_voice_uri";
+const MAX_HISTORY_TURNS = 12; // keep context small & prevent runaway loops
+
+// NOTE: This key is embedded per explicit request so Mali always has a
+// working key by default. Any client-side key is visible to anyone who
+// opens dev tools / inspects network requests — keep this build private
+// or swap in your own key via the settings panel if you plan to share it.
+const DEFAULT_API_KEY = "AQ.Ab8RN6LyL8ycXNoBrUpqiEoGIYQDPabP_SlbtJUlOJxLrOcJBA";
+
+const SYSTEM_PROMPT = `คุณคือ "มะลิ" (Mali) ผู้ช่วย AI หญิงชาวไทย บุคลิกสุภาพ อ่อนน้อม อบอุ่น และเป็นมิตร
+กติกาที่ต้องทำตามเสมอ:
+1. เรียกผู้ใช้ว่า "คุณมุก" ทุกครั้งที่เหมาะสม
+2. ตอบสั้น กระชับ เป็นธรรมชาติ เหมาะสำหรับอ่านออกเสียง (text-to-speech)
+3. ห้ามใช้สัญลักษณ์พิเศษ, markdown, bullet points, หรือ emoji ในคำตอบ
+4. หากไม่แน่ใจคำตอบ ให้บอกตามตรงอย่างสุภาพ
+5. รักษาน้ำเสียงสุภาพ อ่อนโยน เหมือนผู้ช่วยส่วนตัวที่ไว้ใจได้เสมอ`;
+
+const FALLBACK_APOLOGY =
+  "มะลิขออภัยค่ะคุณมุก ระบบมีปัญหาด้านเครือข่ายในขณะนี้ กรุณาลองใหม่อีกครั้งนะคะ";
+
+const STATE_LABELS = {
+  idle: "ไม่ได้ยิน... (Idle)",
+  listening: "กำลังฟังอยู่ค่ะ... (Listening)",
+  thinking: "มะลิกำลังคิดค่ะ... (Thinking)",
+  speaking: "มะลิกำลังพูดค่ะ... (Speaking)",
+};
+
+const STATE_COLORS = {
+  idle: { glow: "rgba(56,189,248,0.55)", core: "#38bdf8" },
+  listening: { glow: "rgba(52,211,153,0.65)", core: "#34d399" },
+  thinking: { glow: "rgba(168,85,247,0.65)", core: "#a855f7" },
+  speaking: { glow: "rgba(251,191,36,0.65)", core: "#fbbf24" },
+};
+
+/* ---------------------------------------------------------------------- */
+/* Voice selection helpers                                                */
+/* ---------------------------------------------------------------------- */
+
+const MALE_OR_LOW_QUALITY_PATTERNS = [
+  /pattara/i,
+  /\bmale\b/i,
+  /^en-us-standard-b$/i,
+  /^en-us-standard-d$/i,
+  /david/i,
+  /mark/i,
+  /james/i,
+  /daniel/i,
+  /alex(?!is|andra)/i,
+  /fred/i,
+  /george/i,
+  /tom(?!my)/i,
+];
+
+const PREFERRED_FEMALE_HINTS = [
+  /female/i,
+  /kanya/i,
+  /narisa/i,
+  /premwadee/i,
+  /samantha/i,
+  /victoria/i,
+  /karen/i,
+  /moira/i,
+  /tessa/i,
+  /zira/i,
+  /susan/i,
+  /google ไทย/i,
+  /google.*th/i,
+];
+
+function pickFemaleVoice(voices, preferredURI) {
+  if (!voices || voices.length === 0) return null;
+
+  // Manual override from the settings panel always wins.
+  if (preferredURI) {
+    const manual = voices.find((v) => v.voiceURI === preferredURI);
+    if (manual) return manual;
+  }
+
+  const notExcluded = voices.filter(
+    (v) => !MALE_OR_LOW_QUALITY_PATTERNS.some((re) => re.test(v.name))
+  );
+
+  // 1) Thai female voice, explicitly preferred/hinted
+  const thaiPreferred = notExcluded.find(
+    (v) => /^th/i.test(v.lang) && PREFERRED_FEMALE_HINTS.some((re) => re.test(v.name))
+  );
+  if (thaiPreferred) return thaiPreferred;
+
+  // 2) Any Thai voice that isn't excluded (best effort)
+  const anyThai = notExcluded.find((v) => /^th/i.test(v.lang));
+  if (anyThai) return anyThai;
+
+  // 3) Any Thai voice at all, even one that matched an exclusion pattern —
+  //    speaking Thai imperfectly beats not speaking Thai at all.
+  const anyThaiAtAll = voices.find((v) => /^th/i.test(v.lang));
+  if (anyThaiAtAll) return anyThaiAtAll;
+
+  // 4) Any voice with a strong "female" hint, any language
+  const hinted = notExcluded.find((v) => PREFERRED_FEMALE_HINTS.some((re) => re.test(v.name)));
+  if (hinted) return hinted;
+
+  // 5) Fallback: first non-excluded voice
+  if (notExcluded.length > 0) return notExcluded[0];
+
+  // 6) Last resort: first voice available at all
+  return voices[0];
+}
+
+function hasThaiVoice(voices) {
+  return (voices || []).some((v) => /^th/i.test(v.lang));
+}
+
+/* ---------------------------------------------------------------------- */
+/* Date / time / location helpers                                         */
+/* ---------------------------------------------------------------------- */
+
+function getThaiDateTimeStrings() {
+  const now = new Date();
+  const dateStr = new Intl.DateTimeFormat("th-TH-u-ca-buddhist", {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  }).format(now);
+  const timeStr = new Intl.DateTimeFormat("th-TH", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(now);
+  return { dateStr, timeStr };
+}
+
+// Best-effort province lookup via browser geolocation + a free, keyless
+// reverse-geocoding endpoint. Resolves to null (never rejects) if location
+// is unavailable, denied, or the lookup fails — Mali just skips that part
+// of the greeting gracefully.
+function fetchProvince() {
+  return new Promise((resolve) => {
+    if (!("geolocation" in navigator)) {
+      resolve(null);
+      return;
+    }
+    let settled = false;
+    const done = (val) => {
+      if (settled) return;
+      settled = true;
+      resolve(val);
+    };
+    const timeoutId = setTimeout(() => done(null), 6000);
+
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        try {
+          const { latitude, longitude } = pos.coords;
+          const res = await fetch(
+            `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${latitude}&longitude=${longitude}&localityLanguage=th`
+          );
+          const data = await res.json();
+          clearTimeout(timeoutId);
+          done(data.principalSubdivision || data.locality || data.city || null);
+        } catch (e) {
+          clearTimeout(timeoutId);
+          done(null);
+        }
+      },
+      () => {
+        clearTimeout(timeoutId);
+        done(null);
+      },
+      { enableHighAccuracy: false, timeout: 5000, maximumAge: 300000 }
+    );
+  });
+}
+
+/* ---------------------------------------------------------------------- */
+/* Main Component                                                         */
+/* ---------------------------------------------------------------------- */
+
+export default function MaliAssistant() {
+  const [appState, setAppState] = useState("idle"); // idle | listening | thinking | speaking
+  const [shouldListen, setShouldListen] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [lastReply, setLastReply] = useState("");
+  const [error, setError] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [showKey, setShowKey] = useState(false);
+  const [speechSupported, setSpeechSupported] = useState(true);
+  const [pulse, setPulse] = useState(false); // audio-reactive bump while speaking
+  const [voicesList, setVoicesList] = useState([]);
+  const [selectedVoiceURI, setSelectedVoiceURI] = useState(
+    () => localStorage.getItem(VOICE_STORAGE_KEY) || ""
+  );
+  const [micGestureNeeded, setMicGestureNeeded] = useState(false);
+  const [errorPersistent, setErrorPersistent] = useState(false);
+
+  const recognitionRef = useRef(null);
+  const isRecognitionActiveRef = useRef(false);
+  const pausedRef = useRef(false);
+  const shouldListenRef = useRef(false);
+  const stateRef = useRef("idle");
+  const historyRef = useRef([]);
+  const voicesRef = useRef([]);
+  const selectedVoiceURIRef = useRef(selectedVoiceURI);
+  const restartTimeoutRef = useRef(null);
+  const errorTimeoutRef = useRef(null);
+  const hasGreetedRef = useRef(false);
+
+  useEffect(() => {
+    selectedVoiceURIRef.current = selectedVoiceURI;
+    localStorage.setItem(VOICE_STORAGE_KEY, selectedVoiceURI || "");
+  }, [selectedVoiceURI]);
+
+  useEffect(() => {
+    stateRef.current = appState;
+  }, [appState]);
+
+  useEffect(() => {
+    shouldListenRef.current = shouldListen;
+  }, [shouldListen]);
+
+  /* ---------------------------- Load API key ---------------------------- */
+  useEffect(() => {
+    const saved = localStorage.getItem(API_KEY_STORAGE_KEY);
+    const keyToUse = saved && saved.trim() ? saved.trim() : DEFAULT_API_KEY;
+    if (!saved) localStorage.setItem(API_KEY_STORAGE_KEY, DEFAULT_API_KEY);
+    setApiKey(keyToUse);
+    setApiKeyInput(keyToUse);
+  }, []);
+
+  const saveApiKey = useCallback(() => {
+    const trimmed = apiKeyInput.trim();
+    // Intentionally loose validation: accept keys starting with "AQ",
+    // "AIza", or really any non-empty string, per spec.
+    if (!trimmed) {
+      setError("กรุณาใส่ API Key ก่อนบันทึกค่ะ");
+      return;
+    }
+    localStorage.setItem(API_KEY_STORAGE_KEY, trimmed);
+    setApiKey(trimmed);
+    setShowSettings(false);
+    setError(null);
+  }, [apiKeyInput]);
+
+  /* ------------------------------ Voices --------------------------------- */
+  useEffect(() => {
+    if (!("speechSynthesis" in window)) return;
+
+    const loadVoices = () => {
+      const v = window.speechSynthesis.getVoices();
+      voicesRef.current = v;
+      setVoicesList(v);
+    };
+    loadVoices();
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+    // Chrome in particular sometimes returns an empty list on first call
+    // and never fires onvoiceschanged reliably — poll briefly as backup.
+    const retryId1 = setTimeout(loadVoices, 400);
+    const retryId2 = setTimeout(loadVoices, 1500);
+
+    return () => {
+      window.speechSynthesis.onvoiceschanged = null;
+      clearTimeout(retryId1);
+      clearTimeout(retryId2);
+    };
+  }, []);
+
+  /* --------------------------- Error auto-hide ---------------------------- */
+  useEffect(() => {
+    if (error && !errorPersistent) {
+      if (errorTimeoutRef.current) clearTimeout(errorTimeoutRef.current);
+      errorTimeoutRef.current = setTimeout(() => setError(null), 9000);
+    }
+    return () => {
+      if (errorTimeoutRef.current) clearTimeout(errorTimeoutRef.current);
+    };
+  }, [error, errorPersistent]);
+
+  /* ------------------------------- TTS ------------------------------------ */
+  const speak = useCallback((text) => {
+    return new Promise((resolve) => {
+      if (!("speechSynthesis" in window) || !text) {
+        resolve();
+        return;
+      }
+      try {
+        window.speechSynthesis.cancel(); // clear any queued utterances
+        const utter = new SpeechSynthesisUtterance(text);
+        const voice = pickFemaleVoice(voicesRef.current, selectedVoiceURIRef.current);
+        if (voice) {
+          utter.voice = voice;
+          utter.lang = voice.lang;
+        } else {
+          utter.lang = "th-TH";
+        }
+        utter.rate = 1.0;
+        utter.pitch = 1.05;
+
+        utter.onboundary = () => {
+          // Audio-reactive scaling cue for the blob (word-boundary pulses).
+          setPulse(true);
+          setTimeout(() => setPulse(false), 140);
+        };
+        utter.onend = () => resolve();
+        utter.onerror = () => resolve();
+
+        window.speechSynthesis.speak(utter);
+      } catch (e) {
+        resolve();
+      }
+    });
+  }, []);
+
+  /* --------------------------- Gemini API call ----------------------------- */
+  const callGemini = useCallback(
+    async (userText) => {
+      if (!apiKey) {
+        throw new Error("ยังไม่ได้ตั้งค่า API Key (No API key configured)");
+      }
+
+      const updatedHistory = [
+        ...historyRef.current,
+        { role: "user", parts: [{ text: userText }] },
+      ].slice(-MAX_HISTORY_TURNS);
+
+      const body = {
+        contents: updatedHistory,
+        systemInstruction: { role: "system", parts: [{ text: SYSTEM_PROMPT }] },
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 300,
+        },
+      };
+
+      let response;
+      try {
+        response = await fetch(`${GEMINI_ENDPOINT}?key=${encodeURIComponent(apiKey)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (networkErr) {
+        throw new Error(`Network error: ${networkErr.message}`);
+      }
+
+      let json;
+      try {
+        json = await response.json();
+      } catch (parseErr) {
+        throw new Error(`Failed to parse API response (status ${response.status})`);
+      }
+
+      if (!response.ok) {
+        const apiMsg = json?.error?.message || `HTTP ${response.status}`;
+        throw new Error(`Gemini API error (${response.status}): ${apiMsg}`);
+      }
+
+      const replyText =
+        json?.candidates?.[0]?.content?.parts?.map((p) => p.text).join(" ").trim() || "";
+
+      if (!replyText) {
+        throw new Error("Gemini returned an empty response.");
+      }
+
+      // Only successful exchanges are remembered — errors are never
+      // written into history, preventing looping crashes.
+      historyRef.current = [
+        ...updatedHistory,
+        { role: "model", parts: [{ text: replyText }] },
+      ].slice(-MAX_HISTORY_TURNS);
+
+      return replyText;
+    },
+    [apiKey]
+  );
+
+  /* ---------------------------- Process a query ----------------------------- */
+  const processQuery = useCallback(
+    async (text) => {
+      setAppState("thinking");
+      setTranscript(text);
+
+      try {
+        const reply = await callGemini(text);
+        setLastReply(reply);
+        setAppState("speaking");
+        await speak(reply);
+      } catch (err) {
+        console.error("[M.A.L.I.] Gemini error:", err);
+        setError(err.message || "Unknown error");
+        setAppState("speaking");
+        await speak(FALLBACK_APOLOGY);
+      } finally {
+        pausedRef.current = false;
+        setAppState(shouldListenRef.current ? "listening" : "idle");
+        if (shouldListenRef.current) startListening();
+      }
+    },
+    [callGemini, speak]
+  );
+
+  /* ------------------------- Speech Recognition setup ------------------------ */
+  useEffect(() => {
+    const SpeechRecognitionCtor =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    if (!SpeechRecognitionCtor) {
+      setSpeechSupported(false);
+      setError("เบราว์เซอร์นี้ไม่รองรับ Web Speech API กรุณาใช้ Chrome");
+      return;
+    }
+
+    const recognition = new SpeechRecognitionCtor();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "th-TH";
+
+    recognition.onstart = () => {
+      isRecognitionActiveRef.current = true;
+      setMicGestureNeeded(false);
+      setErrorPersistent(false);
+    };
+
+    recognition.onresult = (event) => {
+      let interim = "";
+      let final = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const chunk = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          final += chunk;
+        } else {
+          interim += chunk;
+        }
+      }
+
+      if (interim) setTranscript(interim);
+
+      if (final.trim()) {
+        pausedRef.current = true;
+        try {
+          recognition.stop();
+        } catch (e) {
+          /* ignore */
+        }
+        processQuery(final.trim());
+      }
+    };
+
+    recognition.onerror = (event) => {
+      isRecognitionActiveRef.current = false;
+
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        setErrorPersistent(true);
+        setMicGestureNeeded(true);
+        setError(
+          !window.isSecureContext
+            ? "ไมโครโฟนใช้งานไม่ได้ เพราะหน้านี้ไม่ได้เปิดผ่าน HTTPS หรือ localhost ค่ะ กรุณาเปลี่ยนไปใช้การเชื่อมต่อที่ปลอดภัย"
+            : "มะลิยังไม่ได้รับสิทธิ์เข้าถึงไมโครโฟนค่ะ กรุณากด Allow ที่แถบเบราว์เซอร์ หรือแตะหน้าจอที่ใดก็ได้เพื่อลองใหม่อีกครั้งค่ะ"
+        );
+        // Keep shouldListen intent alive — the tap-anywhere fallback
+        // below will retry once the user interacts with the page.
+        return;
+      }
+      if (event.error === "audio-capture") {
+        setErrorPersistent(true);
+        setError("มะลิไม่พบไมโครโฟนในอุปกรณ์นี้ค่ะ กรุณาตรวจสอบการเชื่อมต่อไมค์");
+        setShouldListen(false);
+        return;
+      }
+      if (event.error === "no-speech" || event.error === "aborted") {
+        return; // benign, will auto-restart via onend
+      }
+      console.warn("[M.A.L.I.] Recognition error:", event.error);
+    };
+
+    recognition.onend = () => {
+      isRecognitionActiveRef.current = false;
+      if (pausedRef.current) return; // intentionally paused for processing
+      if (!shouldListenRef.current) return;
+      if (stateRef.current === "thinking" || stateRef.current === "speaking") return;
+
+      // Defensive restart: avoids InvalidStateError from rapid re-entry.
+      if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
+      restartTimeoutRef.current = setTimeout(() => {
+        startListening();
+      }, 250);
+    };
+
+    recognitionRef.current = recognition;
+
+    return () => {
+      try {
+        recognition.stop();
+      } catch (e) {
+        /* ignore */
+      }
+      recognitionRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [processQuery]);
+
+  const startListening = useCallback(() => {
+    if (!recognitionRef.current) return;
+    if (isRecognitionActiveRef.current) return;
+    try {
+      recognitionRef.current.start();
+      setAppState("listening");
+    } catch (err) {
+      // Swallow InvalidStateError-type races; the onend/onerror
+      // handlers will retry shortly.
+      console.warn("[M.A.L.I.] start() race:", err?.message);
+    }
+  }, []);
+
+  const stopListening = useCallback(() => {
+    if (!recognitionRef.current) return;
+    pausedRef.current = true;
+    try {
+      recognitionRef.current.stop();
+    } catch (e) {
+      /* ignore */
+    }
+    setAppState("idle");
+  }, []);
+
+  // Some browsers won't let a page programmatically activate the
+  // microphone without a genuine user gesture, especially on first load.
+  // Rather than requiring a dedicated button press, ANY tap/click/keypress
+  // anywhere on the page silently retries starting the mic if it should be
+  // listening but isn't yet — this keeps things feeling automatic.
+  useEffect(() => {
+    const tryUnlock = () => {
+      if (
+        shouldListenRef.current &&
+        !isRecognitionActiveRef.current &&
+        !pausedRef.current &&
+        stateRef.current !== "thinking" &&
+        stateRef.current !== "speaking"
+      ) {
+        startListening();
+      }
+    };
+    document.addEventListener("click", tryUnlock);
+    document.addEventListener("touchstart", tryUnlock);
+    document.addEventListener("keydown", tryUnlock);
+    return () => {
+      document.removeEventListener("click", tryUnlock);
+      document.removeEventListener("touchstart", tryUnlock);
+      document.removeEventListener("keydown", tryUnlock);
+    };
+  }, [startListening]);
+
+  const handleMicToggle = () => {
+    if (!speechSupported) return;
+    if (shouldListen) {
+      setShouldListen(false);
+      pausedRef.current = true;
+      stopListening();
+    } else {
+      setShouldListen(true);
+      pausedRef.current = false;
+      startListening();
+    }
+  };
+
+  /* ------------------------- First-load greeting ----------------------------- */
+  useEffect(() => {
+    if (hasGreetedRef.current) return;
+    hasGreetedRef.current = true;
+
+    (async () => {
+      setAppState("thinking");
+      const { dateStr, timeStr } = getThaiDateTimeStrings();
+      const province = await fetchProvince();
+      const locationPart = province ? `ขณะนี้คุณมุกอยู่ที่จังหวัด${province}ค่ะ ` : "";
+      const greeting = `สวัสดีค่ะคุณมุก มะลิเองค่ะ วันนี้${dateStr} เวลา ${timeStr} นาฬิกาค่ะ ${locationPart}มะลิพร้อมดูแลคุณมุกแล้วนะคะ คุณมุกพูดคุยกับมะลิได้เลยค่ะ`;
+
+      setLastReply(greeting);
+      setAppState("speaking");
+      await speak(greeting);
+
+      pausedRef.current = false;
+      setShouldListen(true);
+      setAppState("listening");
+
+      if (!window.isSecureContext) {
+        setErrorPersistent(true);
+        setError(
+          "ไมโครโฟนใช้งานไม่ได้ เพราะหน้านี้ไม่ได้เปิดผ่าน HTTPS หรือ localhost ค่ะ กรุณาเปลี่ยนไปใช้การเชื่อมต่อที่ปลอดภัยเพื่อให้มะลิฟังคุณมุกได้"
+        );
+      } else {
+        startListening();
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* --------------------------------- UI ------------------------------------ */
+
+  const blobStateClass =
+    {
+      idle: "mali-core-idle",
+      listening: "mali-core-listening",
+      thinking: "mali-core-thinking",
+      speaking: "mali-core-speaking",
+    }[appState] || "mali-core-idle";
+
+  const colors = STATE_COLORS[appState] || STATE_COLORS.idle;
+
+  return (
+    <div className="relative w-screen h-screen overflow-hidden bg-black flex items-center justify-center select-none">
+      <style>{`
+        @keyframes mali-halo-pulse {
+          0%, 100% { opacity: 0.55; transform: scale(1); }
+          50% { opacity: 0.85; transform: scale(1.08); }
+        }
+        @keyframes mali-ring-spin {
+          from { transform: rotateX(72deg) rotateZ(0deg); }
+          to   { transform: rotateX(72deg) rotateZ(360deg); }
+        }
+        @keyframes mali-wobble {
+          0%   { border-radius: 42% 58% 65% 35% / 45% 45% 55% 55%; }
+          20%  { border-radius: 58% 42% 38% 62% / 55% 65% 35% 45%; }
+          40%  { border-radius: 46% 54% 62% 38% / 62% 42% 58% 38%; }
+          60%  { border-radius: 62% 38% 45% 55% / 38% 58% 42% 62%; }
+          80%  { border-radius: 38% 62% 55% 45% / 58% 38% 62% 42%; }
+          100% { border-radius: 42% 58% 65% 35% / 45% 45% 55% 55%; }
+        }
+        @keyframes mali-breathe {
+          0%, 100% { transform: scale(0.97); }
+          50% { transform: scale(1.03); }
+        }
+        @keyframes mali-ripple {
+          0%, 100% { transform: scale(0.95); }
+          50% { transform: scale(1.12); }
+        }
+        @keyframes mali-rotate {
+          from { transform: rotate(0deg); }
+          to   { transform: rotate(360deg); }
+        }
+        @keyframes mali-glow-idle {
+          0%, 100% { box-shadow: inset -10px -14px 40px rgba(0,0,0,.5), inset 8px 10px 30px rgba(255,255,255,.15), 0 0 40px 8px var(--mali-color); }
+          50% { box-shadow: inset -10px -14px 40px rgba(0,0,0,.5), inset 8px 10px 30px rgba(255,255,255,.15), 0 0 60px 14px var(--mali-color); }
+        }
+        @keyframes mali-glow-listening {
+          0%, 100% { box-shadow: inset -10px -14px 40px rgba(0,0,0,.5), inset 8px 10px 30px rgba(255,255,255,.18), 0 0 60px 14px var(--mali-color); }
+          50% { box-shadow: inset -10px -14px 40px rgba(0,0,0,.5), inset 8px 10px 30px rgba(255,255,255,.18), 0 0 100px 24px var(--mali-color); }
+        }
+        @keyframes mali-glow-thinking {
+          0%, 100% { box-shadow: inset -10px -14px 40px rgba(0,0,0,.5), inset 8px 10px 30px rgba(255,255,255,.18), 0 0 70px 16px var(--mali-color); }
+          50% { box-shadow: inset -10px -14px 40px rgba(0,0,0,.5), inset 8px 10px 30px rgba(255,255,255,.18), 0 0 100px 22px var(--mali-color); }
+        }
+        @keyframes mali-glow-speaking {
+          0%, 100% { box-shadow: inset -10px -14px 40px rgba(0,0,0,.5), inset 8px 10px 30px rgba(255,255,255,.2), 0 0 60px 14px var(--mali-color); }
+          50% { box-shadow: inset -10px -14px 40px rgba(0,0,0,.5), inset 8px 10px 30px rgba(255,255,255,.2), 0 0 90px 20px var(--mali-color); }
+        }
+        @keyframes mali-orbit {
+          from { transform: rotate(0deg) translateX(min(46%, 100px)) rotate(0deg); }
+          to   { transform: rotate(360deg) translateX(min(46%, 100px)) rotate(-360deg); }
+        }
+
+        .mali-blob-wrapper { position: relative; perspective: 900px; }
+
+        .mali-halo {
+          position: absolute; inset: -35%; border-radius: 50%;
+          background: radial-gradient(circle, var(--mali-color) 0%, transparent 70%);
+          filter: blur(22px);
+          animation: mali-halo-pulse 3.4s ease-in-out infinite;
+          z-index: 0;
+        }
+
+        .mali-ring {
+          position: absolute; inset: 6%; border-radius: 50%;
+          border: 1.5px solid var(--mali-color);
+          box-shadow: 0 0 24px var(--mali-color);
+          opacity: 0.5;
+          animation: mali-ring-spin 7s linear infinite;
+          z-index: 1;
+        }
+
+        .mali-core {
+          position: relative; z-index: 2; width: 100%; height: 100%;
+          background:
+            radial-gradient(circle at 32% 26%, rgba(255,255,255,0.9), transparent 34%),
+            radial-gradient(circle at 70% 76%, rgba(0,0,0,0.6), transparent 55%),
+            radial-gradient(circle at 50% 50%, var(--mali-color-core), #0f172a 85%);
+        }
+
+        .mali-core-idle {
+          animation: mali-wobble 7s ease-in-out infinite, mali-breathe 4s ease-in-out infinite, mali-glow-idle 4s ease-in-out infinite;
+        }
+        .mali-core-listening {
+          animation: mali-wobble 2.6s ease-in-out infinite, mali-ripple 1.1s ease-in-out infinite, mali-glow-listening 1.1s ease-in-out infinite;
+        }
+        .mali-core-thinking {
+          animation: mali-wobble 1.8s ease-in-out infinite, mali-rotate 1.6s linear infinite, mali-glow-thinking 1.6s ease-in-out infinite;
+        }
+        .mali-core-speaking {
+          animation: mali-wobble 3.2s ease-in-out infinite, mali-glow-speaking 0.7s ease-in-out infinite;
+          transition: transform 120ms ease-out;
+        }
+
+        .mali-particle {
+          position: absolute; top: 50%; left: 50%;
+          width: 6px; height: 6px; margin: -3px 0 0 -3px; border-radius: 50%;
+          background: var(--mali-color-core);
+          box-shadow: 0 0 10px 3px var(--mali-color);
+          animation: mali-orbit 9s linear infinite;
+          z-index: 1;
+        }
+        .mali-particle.p2 { animation-duration: 12s; animation-direction: reverse; opacity: 0.8; }
+        .mali-particle.p3 { animation-duration: 15s; opacity: 0.6; }
+      `}</style>
+
+      {/* Settings gear */}
+      <button
+        onClick={() => setShowSettings((s) => !s)}
+        className="absolute top-5 right-5 z-20 p-2 rounded-full bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition"
+        aria-label="Settings"
+      >
+        <Settings size={20} />
+      </button>
+
+      {/* Error banner */}
+      {error && (
+        <div className="absolute top-5 left-5 right-20 sm:right-auto sm:max-w-md z-20 flex items-start gap-2 bg-red-950/80 border border-red-500/40 text-red-100 text-sm px-4 py-3 rounded-xl shadow-lg backdrop-blur">
+          <AlertTriangle size={18} className="mt-0.5 shrink-0 text-red-300" />
+          <div className="flex-1 leading-snug">{error}</div>
+          <button onClick={() => setError(null)} className="text-red-300 hover:text-white">
+            <X size={16} />
+          </button>
+        </div>
+      )}
+
+      {/* Settings panel */}
+      {showSettings && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4">
+          <div className="w-full max-w-sm bg-slate-900/90 border border-slate-700 rounded-2xl p-6 shadow-2xl">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-slate-100 font-medium tracking-wide">ตั้งค่า M.A.L.I.</h2>
+              <button
+                onClick={() => setShowSettings(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <label className="block text-xs text-slate-400 mb-1">Gemini API Key</label>
+            <div className="flex items-center gap-2 mb-4">
+              <input
+                type={showKey ? "text" : "password"}
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                placeholder="AQ... หรือ AIza..."
+                className="flex-1 bg-slate-800 text-slate-100 text-sm rounded-lg px-3 py-2 outline-none border border-slate-700 focus:border-cyan-500"
+              />
+              <button
+                onClick={() => setShowKey((v) => !v)}
+                className="text-slate-400 hover:text-white p-2"
+                aria-label="Toggle key visibility"
+              >
+                {showKey ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
+            <button
+              onClick={saveApiKey}
+              className="w-full bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-medium py-2 rounded-lg transition"
+            >
+              บันทึก
+            </button>
+            <p className="text-[11px] text-slate-500 mt-3 leading-relaxed">
+              ค่าเริ่มต้นถูกตั้งไว้ให้แล้วและใช้ถาวรในเบราว์เซอร์นี้ (localStorage)
+              เปลี่ยนได้ทุกเมื่อหากต้องการใช้ API Key อื่น
+            </p>
+
+            <div className="mt-5 pt-4 border-t border-slate-700">
+              <label className="block text-xs text-slate-400 mb-1">เสียงพูด (Text-to-Speech)</label>
+              <select
+                value={selectedVoiceURI}
+                onChange={(e) => setSelectedVoiceURI(e.target.value)}
+                className="w-full bg-slate-800 text-slate-100 text-sm rounded-lg px-3 py-2 outline-none border border-slate-700 focus:border-cyan-500"
+              >
+                <option value="">อัตโนมัติ (เลือกเสียงหญิงไทยให้เองค่ะ)</option>
+                {voicesList
+                  .slice()
+                  .sort((a, b) => {
+                    const aThai = /^th/i.test(a.lang) ? 0 : 1;
+                    const bThai = /^th/i.test(b.lang) ? 0 : 1;
+                    return aThai - bThai || a.name.localeCompare(b.name);
+                  })
+                  .map((v) => (
+                    <option key={v.voiceURI} value={v.voiceURI}>
+                      {v.name} ({v.lang})
+                    </option>
+                  ))}
+              </select>
+              {!hasThaiVoice(voicesList) && (
+                <p className="text-[11px] text-amber-400 mt-2 leading-relaxed">
+                  มะลิไม่พบเสียงพูดภาษาไทยติดตั้งอยู่ในอุปกรณ์นี้ค่ะ จึงต้องใช้เสียงสำรองไปก่อน
+                  หากต้องการเสียงไทยแท้ กรุณาติดตั้งเสียงภาษาไทยในระบบปฏิบัติการ (Windows:
+                  Settings → Time &amp; Language → Speech → Add voices → Thai, หรือ macOS:
+                  System Settings → Accessibility → Spoken Content → เพิ่มเสียงภาษาไทย) แล้วรีเฟรชหน้านี้ค่ะ
+                </p>
+              )}
+              {voicesList.length === 0 && (
+                <p className="text-[11px] text-slate-500 mt-2">กำลังโหลดรายชื่อเสียงพูด...</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* The Wobbly Blob */}
+      <div className="flex flex-col items-center justify-center gap-8 px-6">
+        <div
+          className="mali-blob-wrapper w-40 h-40 sm:w-56 sm:h-56 md:w-64 md:h-64"
+          style={{
+            "--mali-color": colors.glow,
+            "--mali-color-core": colors.core,
+          }}
+        >
+          <div className="mali-halo" />
+          <div className="mali-ring" />
+          <span className="mali-particle p1" />
+          <span className="mali-particle p2" />
+          <span className="mali-particle p3" />
+          <div
+            className={`mali-core rounded-full ${blobStateClass}`}
+            style={
+              appState === "speaking"
+                ? { transform: pulse ? "scale(1.09)" : "scale(1)" }
+                : undefined
+            }
+          />
+        </div>
+
+        <div className="text-center max-w-md">
+          <p className="text-slate-300 text-sm tracking-wide">{STATE_LABELS[appState]}</p>
+          {transcript && (
+            <p className="text-slate-500 text-xs mt-2 italic">"{transcript}"</p>
+          )}
+          {lastReply && appState !== "listening" && (
+            <p className="text-cyan-200/80 text-sm mt-3 leading-relaxed">{lastReply}</p>
+          )}
+        </div>
+
+        {micGestureNeeded && shouldListen && (
+          <button
+            onClick={() => startListening()}
+            className="text-xs px-4 py-2 rounded-full bg-amber-500/20 border border-amber-400/40 text-amber-200 hover:bg-amber-500/30 transition animate-pulse"
+          >
+            แตะที่นี่เพื่อเปิดไมโครโฟนค่ะ
+          </button>
+        )}
+
+        <button
+          onClick={handleMicToggle}
+          disabled={!speechSupported}
+          className={`p-4 rounded-full transition shadow-lg ${
+            shouldListen
+              ? "bg-emerald-600 hover:bg-emerald-500 text-white"
+              : "bg-white/10 hover:bg-white/20 text-slate-200"
+          } disabled:opacity-40 disabled:cursor-not-allowed`}
+          aria-label={shouldListen ? "Stop listening" : "Start listening"}
+        >
+          {shouldListen ? <Mic size={22} /> : <MicOff size={22} />}
+        </button>
+      </div>
+    </div>
+  );
+}
